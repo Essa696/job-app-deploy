@@ -1,73 +1,65 @@
 import os
-from flask import Flask, request, render_template, redirect, url_for
+from flask import Flask, request, render_template, flash, redirect, url_for
+from werkzeug.utils import secure_filename
 from azure.storage.blob import BlobServiceClient
 import pyodbc
-from werkzeug.utils import secure_filename
-import uuid
+from datetime import datetime
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "supersecret")
 
-# -----------------------------
-# ENVIRONMENT VARIABLES (use Azure App Settings in production)
-# -----------------------------
+# Azure storage setup
 AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
 AZURE_STORAGE_CONTAINER = os.environ.get("AZURE_STORAGE_CONTAINER")
-SQL_SERVER = os.environ.get("SQL_SERVER")
-SQL_DATABASE = os.environ.get("SQL_DATABASE")
-SQL_USERNAME = os.environ.get("SQL_USERNAME")
-SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
 
-# -----------------------------
-# DB Connection
-# -----------------------------
-def get_db_connection():
-    conn_str = (
-        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
-        f'SERVER={SQL_SERVER};'
-        f'DATABASE={SQL_DATABASE};'
-        f'UID={SQL_USERNAME};'
-        f'PWD={SQL_PASSWORD}'
-    )
-    return pyodbc.connect(conn_str)
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
 
-# -----------------------------
-# Azure Blob Upload
-# -----------------------------
-def upload_resume_to_blob(file):
-    blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-    container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+# SQL database setup
+server = os.environ.get("SQL_SERVER")
+database = os.environ.get("SQL_DATABASE")
+username = os.environ.get("SQL_USERNAME")
+password = os.environ.get("SQL_PASSWORD")
 
-    filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
-    blob_client = container_client.get_blob_client(filename)
-    blob_client.upload_blob(file, overwrite=True)
-    return blob_client.url
+conn_string = (
+    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+    f"SERVER={server};DATABASE={database};UID={username};PWD={password}"
+)
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.route('/', methods=['GET', 'POST'])
-def apply():
+def index():
     if request.method == 'POST':
-        name = request.form['name']
-        email = request.form['email']
-        position = request.form['position']
-        resume = request.files['resume']
+        try:
+            name = request.form['name']
+            email = request.form['email']
+            phone = request.form['phone']
+            file = request.files['resume']
 
-        if resume:
-            resume_url = upload_resume_to_blob(resume)
+            if file.filename == '':
+                flash("Please upload a resume.", "danger")
+                return redirect(url_for('index'))
 
-            conn = get_db_connection()
+            filename = secure_filename(file.filename)
+            blob_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
+            blob_client = container_client.get_blob_client(blob_name)
+            blob_client.upload_blob(file)
+
+            conn = pyodbc.connect(conn_string)
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO Applications (Name, Email, Position, ResumeUrl) VALUES (?, ?, ?, ?)",
-                (name, email, position, resume_url)
-            )
+            cursor.execute("INSERT INTO Applications (name, email, phone, resume_url) VALUES (?, ?, ?, ?)",
+                           name, email, phone, blob_name)
             conn.commit()
             conn.close()
 
-            return "Application submitted successfully!"
+            flash("Application submitted successfully!", "success")
+            return redirect(url_for('index'))
 
-    return render_template('form.html')
+        except Exception as e:
+            print(f"Error: {e}")
+            flash("There was an error. Please try again later.", "danger")
+            return redirect(url_for('index'))
+
+    return render_template("form.html")
 
 if __name__ == '__main__':
     app.run(debug=True)
